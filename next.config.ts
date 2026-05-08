@@ -1,7 +1,13 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-	/* config options here */
+	serverExternalPackages: [
+		"sequelize",
+		"mysql2",
+		"@google/genai",
+		"@aws-sdk/client-s3",
+		"@aws-sdk/s3-request-presigner",
+	],
 };
 
 export default nextConfig;
