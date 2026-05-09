@@ -9,7 +9,6 @@ import {
 	ImagePlus,
 	Loader2,
 	MessageSquarePlus,
-	PanelRight,
 	Plus,
 	SendHorizontal,
 	Trash2,
@@ -32,7 +31,9 @@ import {
 	SheetTrigger,
 } from "@/components/ui/sheet";
 import { Textarea } from "@/components/ui/textarea";
+import { ChatTypingIndicator } from "@/components/chat-typing-indicator";
 import { MarkdownMessage } from "@/components/markdown-message";
+import { readSseStream } from "@/lib/sse-client";
 import { cn } from "@/lib/utils";
 
 type ChatSummary = {
@@ -178,10 +179,13 @@ export function ProjectWorkspace() {
 	const [messages, setMessages] = useState<ChatMessage[]>([]);
 	const [draft, setDraft] = useState("");
 	const [busy, setBusy] = useState(false);
+	const [awaitingAssistantReply, setAwaitingAssistantReply] = useState(false);
+	const [streamingAssistantText, setStreamingAssistantText] = useState<
+		string | null
+	>(null);
 	const [error, setError] = useState<string | null>(null);
 
 	const [leftOpen, setLeftOpen] = useState(false);
-	const [rightOpen, setRightOpen] = useState(false);
 
 	const [docName, setDocName] = useState("");
 	const [docDescription, setDocDescription] = useState("");
@@ -191,18 +195,12 @@ export function ProjectWorkspace() {
 	const [pendingAttachmentIds, setPendingAttachmentIds] = useState<string[]>(
 		[],
 	);
-	const [includedLibraryDocIds, setIncludedLibraryDocIds] = useState<string[]>(
-		[],
-	);
-	const [librarySelectionLocked, setLibrarySelectionLocked] = useState(false);
-	const [savingIncludeDocId, setSavingIncludeDocId] = useState<string | null>(
-		null,
-	);
 	const [uploadFlow, setUploadFlow] = useState<UploadFlowState>({
 		kind: "idle",
 	});
 
 	const [documentDetailId, setDocumentDetailId] = useState<string | null>(null);
+	const [documentsLibraryOpen, setDocumentsLibraryOpen] = useState(false);
 	const [libraryUploadOpen, setLibraryUploadOpen] = useState(false);
 	const [documentDetail, setDocumentDetail] = useState<DocumentDetail | null>(
 		null,
@@ -232,12 +230,8 @@ export function ProjectWorkspace() {
 		if (!res.ok) throw new Error("Could not load chat.");
 		const data = (await res.json()) as {
 			messages: ChatMessage[];
-			includedLibraryDocumentIds?: string[];
-			librarySelectionLocked?: boolean;
 		};
 		setMessages(data.messages);
-		setIncludedLibraryDocIds(data.includedLibraryDocumentIds ?? []);
-		setLibrarySelectionLocked(Boolean(data.librarySelectionLocked));
 	}, []);
 
 	useEffect(() => {
@@ -253,8 +247,6 @@ export function ProjectWorkspace() {
 
 	useEffect(() => {
 		if (!activeChatId) {
-			setIncludedLibraryDocIds([]);
-			setLibrarySelectionLocked(false);
 			return;
 		}
 		void loadChat(activeChatId).catch((e) =>
@@ -314,8 +306,6 @@ export function ProjectWorkspace() {
 			if (!res.ok) throw new Error("Could not create chat.");
 			const data = (await res.json()) as { chat: { id: string } };
 			setPendingAttachmentIds([]);
-			setIncludedLibraryDocIds([]);
-			setLibrarySelectionLocked(false);
 			await refreshChats();
 			setActiveChatId(data.chat.id);
 			setMessages([]);
@@ -344,8 +334,6 @@ export function ProjectWorkspace() {
 			if (activeChatId === id) {
 				setActiveChatId(null);
 				setMessages([]);
-				setIncludedLibraryDocIds([]);
-				setLibrarySelectionLocked(false);
 			}
 			await refreshChats();
 		} catch (e) {
@@ -409,32 +397,6 @@ export function ProjectWorkspace() {
 		}
 	}
 
-	async function setDocIncludeInChat(
-		documentId: string,
-		includeInChat: boolean,
-	) {
-		if (!activeChatId || librarySelectionLocked) return;
-		setError(null);
-		setSavingIncludeDocId(documentId);
-		try {
-			const res = await fetch(`/api/chats/${activeChatId}`, {
-				method: "PATCH",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ documentId, includeInChat }),
-			});
-			const payload = (await res.json()) as {
-				error?: string;
-				includedLibraryDocumentIds?: string[];
-			};
-			if (!res.ok) throw new Error(payload.error ?? "Could not update.");
-			setIncludedLibraryDocIds(payload.includedLibraryDocumentIds ?? []);
-		} catch (e) {
-			setError(e instanceof Error ? e.message : String(e));
-		} finally {
-			setSavingIncludeDocId(null);
-		}
-	}
-
 	async function uploadChatAttachment(file: File) {
 		if (!activeChatId) {
 			setError("Create or select a chat first.");
@@ -473,32 +435,114 @@ export function ProjectWorkspace() {
 	}
 
 	async function handleSend() {
-		if (!activeChatId) {
+		const chatId = activeChatId;
+		if (!chatId) {
 			setError("Create or select a chat.");
 			return;
 		}
 		const text = draft.trim();
 		if (!text) return;
+		const attachmentIds = [...pendingAttachmentIds];
+		const optimisticId = `local-${crypto.randomUUID()}`;
+		const optimisticAttachments: MsgAttachment[] = attachmentIds.map((id) => {
+			const d = documents.find((x) => x.id === id);
+			return { id, name: d?.name ?? "Attachment" };
+		});
+
 		setError(null);
+		setMessages((prev) => [
+			...prev,
+			{
+				id: optimisticId,
+				role: "user",
+				content: text,
+				attachments: optimisticAttachments,
+			},
+		]);
+		setDraft("");
+		setPendingAttachmentIds([]);
 		setBusy(true);
+		setAwaitingAssistantReply(true);
+		setStreamingAssistantText(null);
+
+		let streamErrorMessage: string | null = null;
+		let streamFinished = false;
+		let streamedAccumulator = "";
+
 		try {
-			const res = await fetch(`/api/chats/${activeChatId}/messages`, {
+			const res = await fetch(`/api/chats/${chatId}/messages`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({
 					content: text,
-					attachmentIds: pendingAttachmentIds,
+					attachmentIds,
 				}),
 			});
-			const payload = (await res.json()) as { error?: string };
-			if (!res.ok) throw new Error(payload.error ?? "Send failed.");
-			setDraft("");
-			setPendingAttachmentIds([]);
-			await loadChat(activeChatId);
+
+			if (!res.ok || !res.body) {
+				let msg = `Send failed (HTTP ${res.status}).`;
+				try {
+					const payload = (await res.json()) as { error?: string };
+					if (payload.error) msg = payload.error;
+				} catch {
+					/* not JSON */
+				}
+				throw new Error(msg);
+			}
+
+			for await (const evt of readSseStream(res)) {
+				let payload: unknown;
+				try {
+					payload = JSON.parse(evt.data);
+				} catch {
+					continue;
+				}
+				if (evt.event === "delta") {
+					const piece =
+						typeof (payload as { text?: unknown }).text === "string"
+							? (payload as { text: string }).text
+							: "";
+					if (!piece) continue;
+					streamedAccumulator += piece;
+					setStreamingAssistantText(streamedAccumulator);
+					setAwaitingAssistantReply(false);
+				} else if (evt.event === "done") {
+					streamFinished = true;
+				} else if (evt.event === "error") {
+					streamErrorMessage =
+						typeof (payload as { message?: unknown }).message === "string"
+							? (payload as { message: string }).message
+							: "The assistant could not finish the response.";
+				}
+				// `meta` is currently informational; ignore on the client.
+			}
+
+			if (streamErrorMessage) throw new Error(streamErrorMessage);
+			if (!streamFinished) {
+				throw new Error("The assistant response ended unexpectedly.");
+			}
+
+			await loadChat(chatId);
 			await refreshChats();
 		} catch (e) {
+			if (!streamedAccumulator) {
+				setMessages((prev) => prev.filter((m) => m.id !== optimisticId));
+				setDraft(text);
+				setPendingAttachmentIds(attachmentIds);
+			} else {
+				// Partial answer was shown; reload from DB so the user sees whatever
+				// the server managed to persist (success or fallback error message).
+				try {
+					await loadChat(chatId);
+					await refreshChats();
+				} catch {
+					/* best-effort */
+				}
+			}
 			setError(e instanceof Error ? e.message : String(e));
 		} finally {
+			setStreamingAssistantText(null);
+			setAwaitingAssistantReply(false);
 			setBusy(false);
 		}
 	}
@@ -559,11 +603,6 @@ export function ProjectWorkspace() {
 		);
 	}
 
-	const includedLibraryDocSet = useMemo(
-		() => new Set(includedLibraryDocIds),
-		[includedLibraryDocIds],
-	);
-
 	function DocumentsPanel({
 		className,
 		onOpenDocument,
@@ -614,13 +653,7 @@ export function ProjectWorkspace() {
 										<Trash2 className="h-4 w-4" />
 									</Button>
 								</div>
-								<div
-									className={cn(
-										"mt-2 flex flex-wrap items-center gap-x-3 gap-y-2 border-t border-border/70 pt-2",
-										!activeChatId && "justify-start",
-										activeChatId && "justify-between",
-									)}
-								>
+								<div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-2 border-t border-border/70 pt-2">
 									<p className="min-w-0 text-xs text-muted-foreground">
 										Status:{" "}
 										<span
@@ -633,45 +666,6 @@ export function ProjectWorkspace() {
 											{d.indexingStatus}
 										</span>
 									</p>
-									{activeChatId ? (
-										<label
-											className={cn(
-												"flex max-w-full cursor-pointer select-none items-center gap-2 rounded-md border border-border bg-background px-2 py-1.5 text-xs leading-none shadow-sm hover:bg-accent/50 sm:shrink-0",
-												librarySelectionLocked && "opacity-90",
-											)}
-										>
-											<input
-												type="checkbox"
-												className="h-4 w-4 shrink-0 cursor-pointer rounded border border-input text-primary accent-primary shadow disabled:opacity-60"
-												checked={includedLibraryDocSet.has(d.id)}
-												disabled={
-													busy ||
-													savingIncludeDocId === d.id ||
-													librarySelectionLocked ||
-													d.indexingStatus !== "ready"
-												}
-												onChange={(e) =>
-													void setDocIncludeInChat(d.id, e.target.checked)
-												}
-												aria-label={`Include ${d.name} in chat context`}
-											/>
-											<span className="text-muted-foreground">
-												<span className="font-medium text-foreground">
-													Include
-												</span>{" "}
-												in chat
-												{librarySelectionLocked ? (
-													<span className="ml-1 text-[10px] font-normal text-muted-foreground/90">
-														(Locked)
-													</span>
-												) : d.indexingStatus !== "ready" ? (
-													<span className="ml-1 text-[10px] font-normal text-muted-foreground/90">
-														(When ready)
-													</span>
-												) : null}
-											</span>
-										</label>
-									) : null}
 								</div>
 							</div>
 						))}
@@ -687,6 +681,41 @@ export function ProjectWorkspace() {
 		);
 	}
 
+	function ProjectDocumentsSidebarBlock({ className }: { className?: string }) {
+		const docCount = documents.length;
+		return (
+			<div
+				className={cn(
+					"flex items-center gap-2 border-b border-border px-3 py-3",
+					className,
+				)}
+			>
+				<button
+					type="button"
+					className="min-w-0 flex-1 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-accent/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+					onClick={() => setDocumentsLibraryOpen(true)}
+					aria-label={`Project documents: ${docCount} uploaded. Open list.`}
+				>
+					<p className="text-2xl font-semibold tabular-nums leading-none">
+						{docCount}
+					</p>
+					<p className="mt-1 text-xs text-muted-foreground">
+						{docCount === 1 ? "document" : "documents"}
+					</p>
+				</button>
+				<Button
+					type="button"
+					variant="outline"
+					size="icon"
+					aria-label="Add document"
+					onClick={() => setLibraryUploadOpen(true)}
+				>
+					<Plus className="h-4 w-4" />
+				</Button>
+			</div>
+		);
+	}
+
 	return (
 		<div className="flex min-h-dvh flex-col bg-background text-foreground">
 			<header className="sticky top-0 z-40 border-b border-border bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80">
@@ -694,40 +723,16 @@ export function ProjectWorkspace() {
 					<div className="flex items-center gap-2 lg:hidden">
 						<Sheet open={leftOpen} onOpenChange={setLeftOpen}>
 							<SheetTrigger asChild>
-								<Button variant="outline" size="icon" aria-label="Chat history">
+								<Button variant="outline" size="icon" aria-label="Menu">
 									<History className="h-4 w-4" />
 								</Button>
 							</SheetTrigger>
 							<SheetContent side="left" className="flex flex-col">
 								<SheetHeader>
-									<SheetTitle>Chats</SheetTitle>
+									<SheetTitle>Chats & documents</SheetTitle>
 								</SheetHeader>
-								<ChatListPanel className="mt-4 min-h-0 flex-1" />
-							</SheetContent>
-						</Sheet>
-						<Sheet open={rightOpen} onOpenChange={setRightOpen}>
-							<SheetTrigger asChild>
-								<Button variant="outline" size="icon" aria-label="Documents">
-									<PanelRight className="h-4 w-4" />
-								</Button>
-							</SheetTrigger>
-							<SheetContent side="right" className="flex flex-col">
-								<SheetHeader className="flex flex-row items-center justify-between gap-2 space-y-0 border-b border-border pb-4 pr-10 text-left">
-									<SheetTitle>Documents</SheetTitle>
-									<Button
-										type="button"
-										variant="outline"
-										size="icon"
-										aria-label="Add document"
-										onClick={() => setLibraryUploadOpen(true)}
-									>
-										<Plus className="h-4 w-4" />
-									</Button>
-								</SheetHeader>
-								<DocumentsPanel
-									className="mt-4 min-h-0 flex-1"
-									onOpenDocument={setDocumentDetailId}
-								/>
+								<ProjectDocumentsSidebarBlock className="mt-2 shrink-0" />
+								<ChatListPanel className="mt-2 min-h-0 flex-1" />
 							</SheetContent>
 						</Sheet>
 					</div>
@@ -752,7 +757,8 @@ export function ProjectWorkspace() {
 
 			<div className="mx-auto flex min-h-0 w-full max-w-[1600px] flex-1 gap-0 px-0 sm:px-2 lg:gap-3 lg:px-4 lg:py-4">
 				<aside className="hidden min-h-0 w-[min(100%,17rem)] shrink-0 flex-col rounded-xl border border-border bg-card lg:flex">
-					<div className="border-b border-border px-3 py-3">
+					<ProjectDocumentsSidebarBlock className="shrink-0" />
+					<div className="shrink-0 border-b border-border px-3 py-3">
 						<p className="text-sm font-semibold">Chat history</p>
 					</div>
 					<div className="min-h-0 flex-1 overflow-hidden p-3">
@@ -765,9 +771,10 @@ export function ProjectWorkspace() {
 						<div className="space-y-4 px-3 py-4 sm:px-4">
 							{!activeChatId ? (
 								<div className="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
-									Create a chat to begin. In the Documents panel check the files you
-									want in context (indexed and ready before the first send). Locked
-									after the first message.
+									Create a chat to begin. The assistant automatically picks the
+									relevant project documents from your library based on each
+									question — just ask naturally. Use the paperclip to add a
+									one-off file to a single message.
 								</div>
 							) : null}
 
@@ -812,6 +819,20 @@ export function ProjectWorkspace() {
 									</div>
 								</div>
 							))}
+
+							{activeChatId && streamingAssistantText !== null ? (
+								<div className="flex justify-start">
+									<div className="max-w-[min(100%,52rem)] rounded-2xl border border-border bg-background px-4 py-3 text-sm shadow-sm">
+										<MarkdownMessage content={streamingAssistantText} />
+										<span
+											className="ml-0.5 inline-block h-3.5 w-1.5 translate-y-0.5 animate-pulse rounded-sm bg-muted-foreground/60 align-middle"
+											aria-hidden
+										/>
+									</div>
+								</div>
+							) : activeChatId && awaitingAssistantReply ? (
+								<ChatTypingIndicator />
+							) : null}
 						</div>
 					</ScrollArea>
 
@@ -910,26 +931,38 @@ export function ProjectWorkspace() {
 					</div>
 				</main>
 
-				<aside className="hidden min-h-0 w-[min(100%,18rem)] shrink-0 flex-col rounded-xl border border-border bg-card lg:flex">
-					<div className="flex items-center justify-between gap-2 border-b border-border px-3 py-3">
-						<p className="font-semibold">Project documents</p>
-						<Button
-							type="button"
-							variant="outline"
-							size="icon"
-							aria-label="Add document"
-							onClick={() => setLibraryUploadOpen(true)}
-						>
-							<Plus className="h-4 w-4" />
-						</Button>
-					</div>
-					<div className="min-h-0 flex-1 overflow-hidden p-3">
-						<DocumentsPanel
-							className="h-full min-h-[40vh]"
-							onOpenDocument={setDocumentDetailId}
-						/>
-					</div>
-				</aside>
+				<Dialog
+					open={documentsLibraryOpen}
+					onOpenChange={setDocumentsLibraryOpen}
+				>
+					<DialogContent className="flex max-h-[min(90vh,720px)] w-[calc(100vw-1.5rem)] max-w-lg flex-col gap-0 overflow-hidden p-0 sm:max-w-lg">
+						<DialogHeader className="flex shrink-0 flex-row items-center justify-between space-y-0 border-b border-border px-6 py-4 pr-14">
+							<DialogTitle>Project documents</DialogTitle>
+							<Button
+								type="button"
+								variant="outline"
+								size="icon"
+								className="shrink-0"
+								aria-label="Add document"
+								onClick={() => {
+									setDocumentsLibraryOpen(false);
+									setLibraryUploadOpen(true);
+								}}
+							>
+								<Plus className="h-4 w-4" />
+							</Button>
+						</DialogHeader>
+						<div className="min-h-0 flex-1 overflow-hidden px-6 pb-6 pt-2">
+							<DocumentsPanel
+								className="h-[min(60vh,420px)]"
+								onOpenDocument={(id) => {
+									setDocumentsLibraryOpen(false);
+									setDocumentDetailId(id);
+								}}
+							/>
+						</div>
+					</DialogContent>
+				</Dialog>
 
 				<Dialog
 					open={libraryUploadOpen}

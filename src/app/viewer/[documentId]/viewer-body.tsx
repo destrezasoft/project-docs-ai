@@ -3,7 +3,10 @@
 import { useParams, useSearchParams } from "next/navigation";
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { MarkdownMessage } from "@/components/markdown-message";
+import {
+	MarkdownMessage,
+	normalizeCitationHighlightMarkdown,
+} from "@/components/markdown-message";
 import { Button } from "@/components/ui/button";
 
 export function ViewerBody() {
@@ -85,11 +88,11 @@ export function ViewerBody() {
 						{isPdf ? (
 							<iframe
 								title={name}
-								className="h-[min(78dvh,900px)] w-full bg-background"
+								className="h-[min(94dvh)] w-full bg-background"
 								src={`${url}#page=${page}`}
 							/>
 						) : (
-							<div className="flex h-[min(78dvh,900px)] flex-col items-center justify-center gap-3 p-6 text-center text-sm text-muted-foreground">
+							<div className="flex h-[min(94dvh)] flex-col items-center justify-center gap-3 p-6 text-center text-sm text-muted-foreground">
 								<p>
 									Inline preview is optimized for PDFs. Use “Open in new tab”
 									for Office files, drawings, or photos.
@@ -110,11 +113,15 @@ export function ViewerBody() {
 					</div>
 				) : null}
 
-				{highlight ? (
+				{/* {highlight ? (
 					<section className="space-y-2 px-3 py-4 sm:px-4">
 						<h2 className="text-sm font-semibold">Cited passage</h2>
 						<div className="rounded-lg border border-border bg-card p-3">
-							<MarkdownMessage content={highlight} />
+							<MarkdownMessage
+								content={normalizeCitationHighlightMarkdown(highlight)}
+								singleNewlinesAsHardBreaks={false}
+								className="[&_p]:whitespace-normal"
+							/>
 						</div>
 						<p className="text-xs text-muted-foreground">
 							The viewer jumps to the cited PDF page when supported by your
@@ -122,7 +129,7 @@ export function ViewerBody() {
 							types.
 						</p>
 					</section>
-				) : null}
+				) : null} */}
 			</main>
 		</div>
 	);

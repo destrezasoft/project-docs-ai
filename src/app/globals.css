@@ -78,3 +78,20 @@ body {
 	font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
 	min-height: 100dvh;
 }
+
+@keyframes chat-typing-bounce {
+	0%,
+	60%,
+	100% {
+		transform: translateY(0);
+		opacity: 0.38;
+	}
+	30% {
+		transform: translateY(-0.3rem);
+		opacity: 1;
+	}
+}
+
+.chat-typing-dot {
+	animation: chat-typing-bounce 1.05s ease-in-out infinite;
+}

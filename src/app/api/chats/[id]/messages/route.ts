@@ -2,22 +2,27 @@ import { NextResponse } from "next/server";
 import { Op } from "sequelize";
 import {
 	Chat,
-	ChatIncludedLibraryDoc,
 	Message,
 	MessageAttachment,
 	ProjectDocument,
 } from "@/models";
 import { ensureDb } from "@/lib/route-setup";
+import type { GroundingMetadata } from "@google/genai";
 import {
 	appendReferencesMarkdown,
 	buildDocLookup,
 	citationsFromGrounding,
-	generateProjectAnswer,
+	selectRelevantDocuments,
+	streamProjectAnswer,
 } from "@/lib/gemini";
 import { stripReferencesSection } from "@/lib/format-chat-history";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
+
+function sseFrame(event: string, data: unknown): string {
+	return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
 
 export async function POST(
 	req: Request,
@@ -46,12 +51,6 @@ export async function POST(
 		return NextResponse.json({ error: "content is required." }, { status: 400 });
 	}
 
-	const inclusions = await ChatIncludedLibraryDoc.findAll({
-		where: { chatId },
-		attributes: ["documentId"],
-	});
-	const includedIds = new Set(inclusions.map((r) => r.documentId));
-
 	const libraryDocsRaw = await ProjectDocument.findAll({
 		where: {
 			scope: "library",
@@ -59,7 +58,6 @@ export async function POST(
 			fileSearchStoreName: { [Op.ne]: null },
 		},
 	});
-	const libraryDocs = libraryDocsRaw.filter((d) => includedIds.has(d.id));
 
 	let chatAttachments: ProjectDocument[] = [];
 	if (attachmentIds.length) {
@@ -80,11 +78,6 @@ export async function POST(
 			);
 		}
 	}
-
-	const contextDocs = [...libraryDocs, ...chatAttachments];
-	const storeNames = contextDocs
-		.map((d) => d.fileSearchStoreName)
-		.filter((s): s is string => Boolean(s));
 
 	const prior = await Message.findAll({
 		where: { chatId },
@@ -112,46 +105,135 @@ export async function POST(
 		});
 	}
 
-	let assistantText = "";
-	let citationsPayload: ReturnType<typeof citationsFromGrounding> = [];
+	const encoder = new TextEncoder();
 
-	try {
-		const { text, grounding } = await generateProjectAnswer({
-			history,
-			userMessage: content,
-			fileSearchStoreNames: storeNames,
-		});
+	const stream = new ReadableStream<Uint8Array>({
+		async start(controller) {
+			const send = (event: string, data: unknown) => {
+				controller.enqueue(encoder.encode(sseFrame(event, data)));
+			};
 
-		citationsPayload = citationsFromGrounding(
-			grounding,
-			buildDocLookup(contextDocs),
-		);
+			let savedAssistant = false;
 
-		assistantText = appendReferencesMarkdown(text, citationsPayload);
-	} catch (e) {
-		const message = e instanceof Error ? e.message : String(e);
-		await Message.create({
-			chatId,
-			role: "assistant",
-			content: `There was a problem generating a response: ${message}`,
-			citationsJson: JSON.stringify([]),
-		});
-		await Chat.update({ updatedAt: new Date() }, { where: { id: chatId } });
-		return NextResponse.json({ error: message }, { status: 502 });
-	}
+			try {
+				const {
+					selectedIds: selectedLibraryIds,
+					reasoning: selectionReasoning,
+				} = await selectRelevantDocuments({
+					history,
+					userMessage: content,
+					candidates: libraryDocsRaw.map((d) => ({
+						id: d.id,
+						name: d.name,
+						description: d.description,
+					})),
+				});
 
-	await Message.create({
-		chatId,
-		role: "assistant",
-		content: assistantText,
-		citationsJson: JSON.stringify(citationsPayload),
+				const selectedSet = new Set(selectedLibraryIds);
+				const libraryDocs = libraryDocsRaw.filter((d) =>
+					selectedSet.has(d.id),
+				);
+				const contextDocs = [...libraryDocs, ...chatAttachments];
+				const storeNames = contextDocs
+					.map((d) => d.fileSearchStoreName)
+					.filter((s): s is string => Boolean(s));
+
+				if (process.env.NODE_ENV !== "production") {
+					console.log(
+						`[chat ${chatId}] document routing -> ${selectedLibraryIds.length}/${libraryDocsRaw.length} library doc(s) selected${
+							selectionReasoning ? `: ${selectionReasoning}` : ""
+						}`,
+					);
+				}
+
+				send("meta", {
+					userMessageId: userRow.id,
+					selectedDocumentIds: selectedLibraryIds,
+					selectedDocumentNames: libraryDocs.map((d) => d.name),
+					attachmentDocumentIds: chatAttachments.map((d) => d.id),
+					reasoning: selectionReasoning,
+				});
+
+				let fullText = "";
+				let grounding: GroundingMetadata | undefined;
+
+				for await (const chunk of streamProjectAnswer({
+					history,
+					userMessage: content,
+					fileSearchStoreNames: storeNames,
+				})) {
+					if (chunk.kind === "delta") {
+						fullText += chunk.text;
+						send("delta", { text: chunk.text });
+					} else {
+						fullText = chunk.text || fullText;
+						grounding = chunk.grounding;
+					}
+				}
+
+				const citationsPayload = citationsFromGrounding(
+					grounding,
+					buildDocLookup(contextDocs),
+				);
+				const assistantText = appendReferencesMarkdown(
+					fullText,
+					citationsPayload,
+				);
+
+				const assistantRow = await Message.create({
+					chatId,
+					role: "assistant",
+					content: assistantText,
+					citationsJson: JSON.stringify(citationsPayload),
+				});
+				savedAssistant = true;
+
+				if (!chat.title) {
+					await chat.update({ title: content.slice(0, 120) });
+				} else {
+					await Chat.update(
+						{ updatedAt: new Date() },
+						{ where: { id: chatId } },
+					);
+				}
+
+				send("done", {
+					assistantMessageId: assistantRow.id,
+					content: assistantText,
+					citations: citationsPayload,
+				});
+			} catch (e) {
+				const message = e instanceof Error ? e.message : String(e);
+				if (!savedAssistant) {
+					try {
+						await Message.create({
+							chatId,
+							role: "assistant",
+							content: `There was a problem generating a response: ${message}`,
+							citationsJson: JSON.stringify([]),
+						});
+						await Chat.update(
+							{ updatedAt: new Date() },
+							{ where: { id: chatId } },
+						);
+					} catch {
+						/* best-effort */
+					}
+				}
+				send("error", { message });
+			} finally {
+				controller.close();
+			}
+		},
 	});
 
-	if (!chat.title) {
-		await chat.update({ title: content.slice(0, 120) });
-	} else {
-		await Chat.update({ updatedAt: new Date() }, { where: { id: chatId } });
-	}
-
-	return NextResponse.json({ ok: true });
+	return new Response(stream, {
+		status: 200,
+		headers: {
+			"Content-Type": "text/event-stream; charset=utf-8",
+			"Cache-Control": "no-cache, no-transform",
+			Connection: "keep-alive",
+			"X-Accel-Buffering": "no",
+		},
+	});
 }
